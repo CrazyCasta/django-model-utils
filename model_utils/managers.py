@@ -17,16 +17,22 @@ class InheritanceQuerySet(QuerySet):
         if not subclasses:
             # only recurse one level on Django < 1.6 to avoid triggering
             # https://code.djangoproject.com/ticket/16572
-            levels = None
             if django.VERSION < (1, 6, 0):
-                levels = 1
-            subclasses = self._get_subclasses_recurse(self.model, levels=levels)
+                subclasses = self._get_subclasses_recurse(self.model, levels=1)
+            else:
+                subclasses = self._get_subclasses_recurse(self.model)
+
+            # even though we're only selecting the first child, cast all of
+            # them
+            qs_subclasses = self._get_subclasses_recurse(self.model)
+        else:
+            qs_subclasses = subclasses
         # workaround https://code.djangoproject.com/ticket/16855
         field_dict = self.query.select_related
         new_qs = self.select_related(*subclasses)
         if isinstance(new_qs.query.select_related, dict) and isinstance(field_dict, dict):
             new_qs.query.select_related.update(field_dict)
-        new_qs.subclasses = subclasses
+        new_qs.subclasses = qs_subclasses
         return new_qs
 
 
@@ -87,9 +93,11 @@ class InheritanceQuerySet(QuerySet):
             node = getattr(obj, rel)
         except ObjectDoesNotExist:
             return None
+        if node == None:
+            return None
         if s:
             child = self._get_sub_obj_recurse(node, s)
-            return child or node
+            return child
         else:
             return node
 
