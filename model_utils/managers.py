@@ -1,7 +1,7 @@
 from __future__ import unicode_literals
 import django
 from django.db import models
-from django.db.models.fields.related import OneToOneField
+from django.db.models.fields.related import OneToOneField, ManyToOneRel
 from django.db.models.query import QuerySet
 from django.core.exceptions import ObjectDoesNotExist
 
@@ -13,6 +13,15 @@ except ImportError: # Django < 1.5
 
 
 class InheritanceQuerySet(QuerySet):
+    def _select_related(self, *related):
+        # workaround https://code.djangoproject.com/ticket/16855
+        field_dict = self.query.select_related
+        new_qs = self.select_related(*related)
+        if isinstance(new_qs.query.select_related, dict) and isinstance(field_dict, dict):
+            new_qs.query.select_related.update(field_dict)
+
+        return new_qs
+
     def select_subclasses(self, *subclasses):
         if not subclasses:
             # only recurse one level on Django < 1.6 to avoid triggering
@@ -27,17 +36,45 @@ class InheritanceQuerySet(QuerySet):
             qs_subclasses = self._get_subclasses_recurse(self.model)
         else:
             qs_subclasses = subclasses
-        # workaround https://code.djangoproject.com/ticket/16855
-        field_dict = self.query.select_related
-        new_qs = self.select_related(*subclasses)
-        if isinstance(new_qs.query.select_related, dict) and isinstance(field_dict, dict):
-            new_qs.query.select_related.update(field_dict)
+
+        new_qs = self._select_related(*subclasses)
+
         new_qs.subclasses = qs_subclasses
         return new_qs
 
 
+    def select_related_subclasses(self, *related):
+        all_related = []
+
+        related_fields = []
+        for f in self.model._meta.fields:
+            if isinstance(f.rel, ManyToOneRel):
+                if not related or f.name in related:
+                    related_fields.append(f)
+
+        for rel_field in related_fields:
+            all_related.append(rel_field.name)
+
+        related_subclasses = {}
+
+        for f in related_fields:
+            if django.VERSION < (1, 6, 0):
+                subclasses = self._get_subclasses_recurse(f.rel.to, levels=1)
+            else:
+                subclasses = self._get_subclasses_recurse(f.rel.to)
+
+            all_related.extend(subclasses)
+            related_subclasses[f.name] = \
+                    self._get_subclasses_recurse(f.rel.to)
+
+        new_qs = self._select_related(*all_related)
+        new_qs.related_subclasses = related_subclasses
+
+        return new_qs
+
+
     def _clone(self, klass=None, setup=False, **kwargs):
-        for name in ['subclasses', '_annotated']:
+        for name in ['subclasses', '_annotated', 'related_subclasses']:
             if hasattr(self, name):
                 kwargs[name] = getattr(self, name)
         return super(InheritanceQuerySet, self)._clone(klass, setup, **kwargs)
@@ -49,26 +86,29 @@ class InheritanceQuerySet(QuerySet):
         return qset
 
 
+    def _handle_related(self, obj):
+        if getattr(self, 'related_subclasses', False):
+            for f in self.model._meta.fields:
+                if f.name in self.related_subclasses:
+                    cached_obj = getattr(obj, f.get_cache_name(), None)
+                    subclasses = self.related_subclasses[f.name]
+                    sub_obj = self._get_sub_obj_recurse_list(cached_obj,
+                                                             subclasses)
+                    setattr(obj, f.get_cache_name(), sub_obj)
+
+        return obj
+
+
     def iterator(self):
         iter = super(InheritanceQuerySet, self).iterator()
         if getattr(self, 'subclasses', False):
             for obj in iter:
-                sub_obj = None
-                for s in self.subclasses:
-                    sub_obj = self._get_sub_obj_recurse(obj, s)
-                    if sub_obj:
-                        break
-                if not sub_obj:
-                    sub_obj = obj
+                obj = self._handle_related(obj)
 
-                if getattr(self, '_annotated', False):
-                    for k in self._annotated:
-                        setattr(sub_obj, k, getattr(obj, k))
-
-                yield sub_obj
+                yield self._get_sub_obj_recurse_list(obj, self.subclasses)
         else:
             for obj in iter:
-                yield obj
+                yield self._handle_related(obj)
 
 
     def _get_subclasses_recurse(self, model, levels=None):
@@ -102,6 +142,22 @@ class InheritanceQuerySet(QuerySet):
             return node
 
 
+    def _get_sub_obj_recurse_list(self, obj, subclasses):
+        sub_obj = None
+        for s in subclasses:
+            sub_obj = self._get_sub_obj_recurse(obj, s)
+            if sub_obj:
+                break
+        if not sub_obj:
+            sub_obj = obj
+
+        if getattr(self, '_annotated', False):
+            for k in self._annotated:
+                setattr(sub_obj, k, getattr(obj, k))
+
+        return sub_obj
+
+
 
 class InheritanceManager(models.Manager):
     use_for_related_fields = True
@@ -111,6 +167,9 @@ class InheritanceManager(models.Manager):
 
     def select_subclasses(self, *subclasses):
         return self.get_query_set().select_subclasses(*subclasses)
+
+    def select_related_subclasses(self, *related):
+        return self.get_query_set().select_related_subclasses(*related)
 
     def get_subclass(self, *args, **kwargs):
         return self.get_query_set().select_subclasses().get(*args, **kwargs)
